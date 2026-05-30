@@ -1,0 +1,15 @@
+# Rust build output (workspace-wide)
+/target
+
+# Backup files
+**/*.rs.bk
+
+# Secrets / local config — never commit keys or RPC URLs
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
