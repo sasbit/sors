@@ -1,4 +1,4 @@
-//SDPX-License-Identifier: MIT
+//SPDX-License-Identifier: MIT
 
 pragma solidity ^0.8.24;
 
@@ -11,13 +11,13 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 contract MockUSDC is ERC20, Ownable {
     constructor(address initialOwner)
         ERC20("Mock USDC", "mUSDC")
-        Ownable(initalOwner)
+        Ownable(initialOwner)
 
     {
         _mint(initialOwner, 1_000_000 * 10 ** decimals());
     }
 
-    function decimals() public pure override return (uint8) {
+    function decimals() public pure override returns (uint8) {
         return 6;
     }
 
