@@ -12,7 +12,7 @@ contract DeployRepo is Script {
     //run() is the conventional entrypoint for forge script calls
     function run() external {
         //load the deployer key from the environment
-        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        uint256 deployerKey = vm.envUint("LENDER_PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
 
         vm.startBroadcast(deployerKey);
