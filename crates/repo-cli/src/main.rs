@@ -7,57 +7,90 @@ use eyre::Result;
 
 sol! {
     #[sol(rpc)]
-    contract MockBUIDL {
-        function transfer(address to, uint256 amount) external returns (bool);
+    contract IERC20 {
+        function approve(address spender, uint256 amount) external returns (bool);
         function balanceOf(address account) external view returns (uint256);
     }
 }
 
-//tokio for Rust async operations 
+sol! {
+    #[sol(rpc)]
+    contract RepoVault {
+        function fundCash(uint256 amount) external;
+        function depositCollateral(uint256 amount) external;
+        function borrow(uint256 amount) external;
+        function repay(uint256 amount)  external;
+        function withdrawCollateral(uint256 amount) external;
+        function collateralOf(address borrower) external view returns (uint256);
+        function debtOf(address borrower) external view returns (uint256);
+        function maxBorrow(address borrower) external view returns (uint256);
+        function isHealthy(address borrower) external view returns (bool);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    //loading env variables
     let rpc_url = env::var("SEPOLIA_RPC_URL")?;
     let private_key = env::var("PRIVATE_KEY")?;
-    let contract_address: Address = env::var("CONTRACT_ADDRESS")?.parse()?;
-    let recipient: Address = env::var("RECIPIENT")?.parse()?;
+    let buidl_address : Address = env::var("MOCK_BUIDL_ADDRESS")?.parse()?;
+    let usdc_address:  Address = env::var("MOCK_USDC_ADDRESS")?.parse()?;
+    let vault_address: Address = env::var("REPO_VAULT_ADDRESS")?.parse()?;
 
-    //setting up provider and signer
     let signer: PrivateKeySigner = private_key.parse()?;
-    let sender = signer.address();
+    let me = signer.address();
     let provider = ProviderBuilder::new().wallet(signer).connect_http(rpc_url.parse()?);
 
-    //contract handle
-    let contract = MockBUIDL::new(contract_address, provider);
+    let buidl = IERC20::new(buidl_address, provider.clone());
+    let usdc  = IERC20::new(usdc_address,  provider.clone());
+    let vault = RepoVault::new(vault_address, provider.clone());
 
-    let scale = U256::from(10).pow(U256::from(18));
+    let buidl_scale = U256::from(10).pow(U256::from(18)); // mBUIDL: 18 decimals
+    let usdc_scale  = U256::from(10).pow(U256::from(6));  // mUSDC:  6 decimals
 
-    //reading two balances
-    let before_sender = contract.balanceOf(sender).call().await?;
-    let before_recipient = contract.balanceOf(recipient).call().await?;
-    println!("---before---");
-    println!("sender: {} : {} mBUIDL", sender, before_sender / scale);
-    println!("recipient: {} : {} mBUIDL", recipient, before_recipient / scale);
+    let fund_amount       = U256::from(1_000u64) * usdc_scale;  // lender seeds 1,000 mUSDC
+    let collateral_amount = U256::from(100u64)   * buidl_scale; // borrower posts 100 mBUIDL
+    let borrow_amount     = U256::from(98u64)    * usdc_scale;  // draw 98 mUSDC (the 2% haircut ceiling)
 
-    //sending transaction
-    let amount = U256::from(100u64) * scale;
-    println!("\n--- sending 100 mBUIDL ---");
-    let pending= contract.transfer(recipient, amount).send().await?;
-    let tx_hash = *pending.tx_hash();
-    println!("  tx hash  : {}", tx_hash);
-    println!("  etherscan: https://sepolia.etherscan.io/tx/{}", tx_hash);
-    println!("  waiting for confirmation...");
-    
-    //waiting for receipt
-    let receipt = pending.get_receipt().await?;
-    println!(" confirmed in block {}\n", receipt.block_number.unwrap_or_default());
+    println!("=== initial ===");
+    println!("my mBUIDL : {}", buidl.balanceOf(me).call().await? / buidl_scale);
+    println!("my mUSDC  : {}", usdc.balanceOf(me).call().await? / usdc_scale);
+    println!("vault mUSDC: {}", usdc.balanceOf(vault_address).call().await? / usdc_scale);
+    println!("collateralOf(me): {}", vault.collateralOf(me).call().await? / buidl_scale);
+    println!("debtOf(me)      : {}", vault.debtOf(me).call().await? / usdc_scale);
 
-    //reading two balances
-    let after_sender = contract.balanceOf(sender).call().await?;
-    let after_recipient = contract.balanceOf(recipient).call().await?;
-    println!("---after---");
-    println!("sender: {} : {} mBUIDL", sender, after_sender / scale);
-    println!("recipient: {} : {} mBUIDL", recipient, after_recipient / scale);
+    // --- Lender side: approve + fund the vault's cash pool ---
+    println!("\n[1/6] approve mUSDC -> vault");
+    usdc.approve(vault_address, U256::MAX).send().await?.get_receipt().await?;
+
+    println!("[2/6] fundCash 1,000 mUSDC");
+    vault.fundCash(fund_amount).send().await?.get_receipt().await?;
+
+    // --- Borrower side: approve + post collateral ---
+    println!("[3/6] approve mBUIDL -> vault");
+    buidl.approve(vault_address, U256::MAX).send().await?.get_receipt().await?;
+
+    println!("[4/6] depositCollateral 100 mBUIDL");
+    vault.depositCollateral(collateral_amount).send().await?.get_receipt().await?;
+
+    // --- Draw cash against the collateral ---
+    println!("[5/6] borrow 98 mUSDC");
+    vault.borrow(borrow_amount).send().await?.get_receipt().await?;
+
+    println!("\n=== after borrow ===");
+    println!("maxBorrow(me)   : {}", vault.maxBorrow(me).call().await? / usdc_scale);
+    println!("debtOf(me)      : {}", vault.debtOf(me).call().await? / usdc_scale);
+    println!("isHealthy(me)   : {}", vault.isHealthy(me).call().await?);
+    println!("my mUSDC        : {}", usdc.balanceOf(me).call().await? / usdc_scale);
+
+    // --- Close out: repay debt, reclaim collateral ---
+    println!("\n[6/6] repay 98 mUSDC + withdraw 100 mBUIDL");
+    vault.repay(borrow_amount).send().await?.get_receipt().await?;
+    vault.withdrawCollateral(collateral_amount).send().await?.get_receipt().await?;
+
+    println!("\n=== final ===");
+    println!("collateralOf(me): {}", vault.collateralOf(me).call().await? / buidl_scale);
+    println!("debtOf(me)      : {}", vault.debtOf(me).call().await? / usdc_scale);
+    println!("isHealthy(me)   : {}", vault.isHealthy(me).call().await?);
 
     Ok(())
 }
