@@ -1,110 +1,142 @@
-//on-chain settlement venue - escrows tokenized treasurey collateral (mBUIDL) and lets a borrower draw cash (mUSDC) against it, capped by a threshhold. Matching/pricing stays off-chain, the vaul enforces custody + collateralization
-//SPDX-License-Identifier: MIT
-
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-//ERC20 interface is all we need (transfer(), transferFrom(), balanceOf())
+// On-chain settlement venue — escrows tokenized treasury collateral and lets a borrower
+// draw cash against it, capped by a per-token haircut. Supports multiple collateral tokens
+// via an ICollateralAdapter registry. Matching/pricing stays off-chain; the vault enforces
+// custody + collateralisation.
+
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "./ICollateralAdapter.sol";
 
 contract RepoVault is Ownable {
     using SafeERC20 for IERC20;
-    
-    IERC20 public immutable collateralToken; 
-    IERC20 public immutable cashToken;
 
-    uint256 public haircutBps; //200 = 2% haircut
-    uint256 public nav; //cash units(6dp) per 1 whole collateral token
+    IERC20 public immutable cashToken; // 6-decimal stablecoin (mUSDC / USDC)
 
-    mapping(address => uint256) public collateralOf; //escrowed collateral per borrower
-    mapping(address => uint256) public debtOf; //cash drawn per borrower nav = Net Asset Value
+    // token address → adapter; zero address means the token is not registered
+    mapping(address => ICollateralAdapter) public adapterOf;
+    // enumerable list used for collateral-value loops
+    address[] public collateralTokens;
 
+    // borrower → token → escrowed amount (native token units)
+    mapping(address => mapping(address => uint256)) public collateralOf;
+    // borrower → cash drawn (6 dp)
+    mapping(address => uint256) public debtOf;
+
+    event AdapterSet(address indexed token, address indexed adapter);
     event CashFunded(address indexed from, uint256 amount);
-    event CollateralDeposited(address indexed borrower, uint256 amount);
-    event CollateralWithdrawn(address indexed borrower, uint256 amount);
+    event CollateralDeposited(address indexed borrower, address indexed token, uint256 amount);
+    event CollateralWithdrawn(address indexed borrower, address indexed token, uint256 amount);
     event Borrowed(address indexed borrower, uint256 amount);
     event Repaid(address indexed borrower, uint256 amount);
-    event NavUpdated(uint256 oldNav, uint256 newNav);
-    event HaircutUpdated(uint256 oldHaircutBps, uint256 newHaircutBps);
-    
-    constructor (
-        address collateralToken_,
-        address cashToken_,
-        uint256 haircutBps_,
-        uint256 nav_,
-        address initialOwner
-    ) Ownable(initialOwner) {
-        require(collateralToken_ != address(0) && cashToken_ != address(0), "zero token");
-        require(haircutBps_ <= 10_000, "haircut > 100%");
-        collateralToken = IERC20(collateralToken_);
+
+    constructor(address cashToken_, address initialOwner) Ownable(initialOwner) {
+        require(cashToken_ != address(0), "zero cash token");
         cashToken = IERC20(cashToken_);
-        haircutBps = haircutBps_;
-        nav = nav_;
     }
 
-    //Admin sets the nav to be posted
-    function setNav(uint256 newNav) external onlyOwner {
-        emit NavUpdated(nav, newNav);
-        nav = newNav;
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    // Register a new collateral token or replace an existing adapter (e.g. to upgrade
+    // from admin-NAV to an oracle-backed version). Cannot set adapter to zero — existing
+    // positions must always have a valid pricer. To retire a token, deploy an adapter
+    // with haircutBps = 10_000 (zero borrowing capacity).
+    function setAdapter(address token, address adapter) external onlyOwner {
+        require(token   != address(0), "zero token");
+        require(adapter != address(0), "zero adapter");
+        require(ICollateralAdapter(adapter).token() == token, "adapter/token mismatch");
+        if (address(adapterOf[token]) == address(0)) {
+            collateralTokens.push(token); // first registration — add to enumerable list
+        }
+        adapterOf[token] = ICollateralAdapter(adapter);
+        emit AdapterSet(token, adapter);
     }
 
-    function setHaircut(uint256 newHaircutBps) external onlyOwner {
-        require(newHaircutBps <= 10_000, "haircut > 100%");
-        emit HaircutUpdated(haircutBps, newHaircutBps);
-        haircutBps = newHaircutBps;
-    }
+    // ── Lender ────────────────────────────────────────────────────────────────
 
-    //lender side: funds cash into the vault so the borrower has something to draw from
-    //safeTransferFrom pulls amount from the caller into the vault which requries the caller to have falled cashToken.approve(vault, amount) first (standard ERC20 allowance flow)
     function fundCash(uint256 amount) external {
         cashToken.safeTransferFrom(msg.sender, address(this), amount);
         emit CashFunded(msg.sender, amount);
     }
 
-    //borrower side: deposit collateral pulls collateral from the borrower into the vault (again, needs prior approve)
-    function depositCollateral(uint256 amount) external {
-        collateralToken.safeTransferFrom(msg.sender, address(this), amount);
-        // then credits the borrower's ledger entry
-        collateralOf[msg.sender] += amount;
-        emit CollateralDeposited(msg.sender, amount);
+    // ── Borrower ──────────────────────────────────────────────────────────────
+
+    function depositCollateral(address token, uint256 amount) external {
+        require(address(adapterOf[token]) != address(0), "token not registered");
+        require(amount > 0, "zero amount");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        collateralOf[msg.sender][token] += amount;
+        emit CollateralDeposited(msg.sender, token, amount);
     }
 
-    //borrowing cash
+    function withdrawCollateral(address token, uint256 amount) external {
+        require(collateralOf[msg.sender][token] >= amount, "insufficient collateral");
+        collateralOf[msg.sender][token] -= amount;
+        require(debtOf[msg.sender] <= maxBorrow(msg.sender), "would undercollateralize");
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit CollateralWithdrawn(msg.sender, token, amount);
+    }
+
     function borrow(uint256 amount) external {
         require(amount > 0, "zero amount");
         debtOf[msg.sender] += amount;
-        require(debtOf[msg.sender] <= maxBorrow(msg.sender), "exceeds max borrow limit");
+        require(debtOf[msg.sender] <= maxBorrow(msg.sender), "exceeds max borrow");
         cashToken.safeTransfer(msg.sender, amount);
         emit Borrowed(msg.sender, amount);
     }
 
-    //repaying the loan
     function repay(uint256 amount) external {
-        uint256 debt = debtOf[msg.sender];
-        uint256 payment = amount > debt ? debt : amount; //clamp: never overpay
+        uint256 debt    = debtOf[msg.sender];
+        uint256 payment = amount > debt ? debt : amount; // clamp: never overpay
         cashToken.safeTransferFrom(msg.sender, address(this), payment);
         debtOf[msg.sender] = debt - payment;
         emit Repaid(msg.sender, payment);
     }
 
-    //withdrawing collateral
-    function withdrawCollateral(uint256 amount)  external {
-        require(collateralOf[msg.sender] >= amount, "insufficient collateral");
-        collateralOf[msg.sender] -= amount;
-        require(debtOf[msg.sender] <= maxBorrow(msg.sender), "would be undercollateralized");
-        collateralToken.safeTransfer(msg.sender, amount);
-        emit CollateralWithdrawn(msg.sender, amount);
+    // ── View ──────────────────────────────────────────────────────────────────
+
+    // Cash value (6 dp) of a single token position for a borrower.
+    function tokenCollateralValue(address token, address borrower) public view returns (uint256) {
+        ICollateralAdapter adapter = adapterOf[token];
+        if (address(adapter) == address(0)) return 0;
+        uint256 amount = collateralOf[borrower][token];
+        if (amount == 0) return 0;
+        return amount * adapter.nav() / (10 ** adapter.decimals());
     }
 
-    function collateralValue(address borrower) public view returns (uint256) {
-        return collateralOf[borrower] * nav / 1e18;
+    // Total cash value (6 dp) of all collateral across every registered token.
+    function totalCollateralValue(address borrower) public view returns (uint256) {
+        uint256 total;
+        uint256 len = collateralTokens.length;
+        for (uint256 i; i < len; ++i) {
+            total += tokenCollateralValue(collateralTokens[i], borrower);
+        }
+        return total;
     }
+
+    // Maximum cash borrowable. Each token's contribution is haircutted by its own rate,
+    // so mixed collateral baskets are priced correctly.
     function maxBorrow(address borrower) public view returns (uint256) {
-        return collateralValue(borrower) * (10_000 - haircutBps) / 10_000;
+        uint256 total;
+        uint256 len = collateralTokens.length;
+        for (uint256 i; i < len; ++i) {
+            address token = collateralTokens[i];
+            ICollateralAdapter adapter = adapterOf[token];
+            if (address(adapter) == address(0)) continue;
+            uint256 value = tokenCollateralValue(token, borrower);
+            total += value * (10_000 - adapter.haircutBps()) / 10_000;
+        }
+        return total;
     }
+
     function isHealthy(address borrower) public view returns (bool) {
         return debtOf[borrower] <= maxBorrow(borrower);
     }
 
+    function collateralTokenCount() external view returns (uint256) {
+        return collateralTokens.length;
+    }
 }
