@@ -25,6 +25,8 @@ contract RepoVault is Ownable {
     mapping(address => mapping(address => uint256)) public collateralOf;
     // borrower → cash drawn (6 dp)
     mapping(address => uint256) public debtOf;
+    // KYC allowlist
+    mapping(address => bool) public whitelisted;
 
     event AdapterSet(address indexed token, address indexed adapter);
     event CashFunded(address indexed from, uint256 amount);
@@ -32,7 +34,9 @@ contract RepoVault is Ownable {
     event CollateralWithdrawn(address indexed borrower, address indexed token, uint256 amount);
     event Borrowed(address indexed borrower, uint256 amount);
     event Repaid(address indexed borrower, uint256 amount);
-
+    event Whitelisted(address indexed account, bool status);
+    event Liquidated(address indexed borrower, uint256 debt);
+    
     constructor(address cashToken_, address initialOwner) Ownable(initialOwner) {
         require(cashToken_ != address(0), "zero cash token");
         cashToken = IERC20(cashToken_);
@@ -55,6 +59,11 @@ contract RepoVault is Ownable {
         emit AdapterSet(token, adapter);
     }
 
+    function setWhiteListed(address account, bool status) external onlyOwner {
+        whitelisted[account] = status;
+        emit Whitelisted(account, status);
+    }
+
     // ── Lender ────────────────────────────────────────────────────────────────
 
     function fundCash(uint256 amount) external {
@@ -63,8 +72,8 @@ contract RepoVault is Ownable {
     }
 
     // ── Borrower ──────────────────────────────────────────────────────────────
-
     function depositCollateral(address token, uint256 amount) external {
+        require(whitelisted[msg.sender], "not whitelisted");
         require(address(adapterOf[token]) != address(0), "token not registered");
         require(amount > 0, "zero amount");
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
@@ -81,6 +90,7 @@ contract RepoVault is Ownable {
     }
 
     function borrow(uint256 amount) external {
+        require(whitelisted[msg.sender], "not whitelisted");
         require(amount > 0, "zero amount");
         debtOf[msg.sender] += amount;
         require(debtOf[msg.sender] <= maxBorrow(msg.sender), "exceeds max borrow");
@@ -138,5 +148,20 @@ contract RepoVault is Ownable {
 
     function collateralTokenCount() external view returns (uint256) {
         return collateralTokens.length;
+    }
+
+    function liquidate(address borrower) external onlyOwner {
+        require(!isHealthy(borrower), "position is healthy");
+        uint256 debt = debtOf[borrower];
+        debtOf[borrower] = 0;
+        uint256 len = collateralTokens.length;
+        for (uint256 i; i < len; ++i) {
+            address token = collateralTokens[i];
+            uint256 amount = collateralOf[borrower][token];
+            if (amount == 0) continue;
+            collateralOf[borrower][token] = 0;
+            IERC20(token).safeTransfer(msg.sender, amount);
+        }
+        emit Liquidated(borrower, debt);
     }
 }

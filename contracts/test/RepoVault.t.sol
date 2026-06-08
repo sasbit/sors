@@ -41,6 +41,7 @@ contract RepoVaultTest is Test {
 
         // give borrower 100 mBUIDL and 100 mOUSG
         borrower = makeAddr("borrower");
+        vault.setWhiteListed(borrower, true); // KYC onboarding required by deposit/borrow
         buidl.transfer(borrower, 100e18);
         ousg.transfer(borrower,  100e18);
 
@@ -213,6 +214,48 @@ contract RepoVaultTest is Test {
         vm.expectRevert(bytes("stale price"));
         vault.maxBorrow(borrower); // price read reverts
     }
+
+    function test_RevertWhen_NotWhitelisted() public {
+        address stranger = makeAddr("stranger");
+
+        vm.startPrank(stranger);
+        buidl.approve(address(vault), type(uint256).max);
+        vm.expectRevert(bytes("not whitelisted"));
+        vault.depositCollateral(address(buidl), 1e18);
+        vm.stopPrank();
+    }
+
+    function test_Liquidate_UnhealthyPosition() public {
+        vm.startPrank(borrower);
+        vault.depositCollateral(address(buidl), 100e18);
+        vault.borrow(98e6); // borrow at the 98% ceiling
+        vm.stopPrank();
+
+        // drop NAV so collateralValue falls below debt: 100 * 0.97 * 98% = 95.06 < 98
+        SimpleCollateralAdapter lowNavAdapter = new SimpleCollateralAdapter(
+            address(buidl), 18, 0.97e6, HAIRCUT, address(this)
+        );
+        vault.setAdapter(address(buidl), address(lowNavAdapter));
+        assertFalse(vault.isHealthy(borrower));
+
+        uint256 ownerBuidlBefore = buidl.balanceOf(address(this));
+        vault.liquidate(borrower);
+
+        assertEq(vault.debtOf(borrower), 0);
+        assertEq(vault.collateralOf(borrower, address(buidl)), 0);
+        assertEq(buidl.balanceOf(address(this)), ownerBuidlBefore + 100e18);
+    }
+
+    function test_RevertWhen_Liquidate_HealthyPosition() public {
+        vm.startPrank(borrower);
+        vault.depositCollateral(address(buidl), 100e18);
+        vault.borrow(50e6); // well under the ceiling
+        vm.stopPrank();
+
+        vm.expectRevert(bytes("position is healthy"));
+        vault.liquidate(borrower);
+    }
+
 }
 
 
