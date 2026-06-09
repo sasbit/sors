@@ -11,39 +11,50 @@ import "../src/ChainLinkCollateralAdapter.sol";
 
 contract RepoVaultTest is Test {
     MockBUIDL               internal buidl;
-    MockBUIDL               internal ousg;  // reuses MockBUIDL (18 dp) as a second collateral
+    MockBUIDL               internal ousg;
     MockUSDC                internal usdc;
     SimpleCollateralAdapter internal buidlAdapter;
     SimpleCollateralAdapter internal ousgAdapter;
     RepoVault               internal vault;
 
+    address internal lender;
     address internal borrower;
+    address internal keeper; // liquidator role
 
-    uint256 internal constant NAV     = 1e6;  // par: 1 whole token = 1 mUSDC
-    uint256 internal constant HAIRCUT = 200;  // 2%
+    uint256 internal constant NAV          = 1e6;  // 1 whole token = 1 mUSDC
+    uint256 internal constant HAIRCUT      = 200;  // 2% initial margin
+    uint256 internal constant MAINTENANCE  = 100;  // 1% maintenance margin
 
     function setUp() public {
         buidl = new MockBUIDL(address(this));
-        ousg  = new MockBUIDL(address(this)); // second 18-dp collateral
+        ousg  = new MockBUIDL(address(this));
         usdc  = new MockUSDC(address(this));
 
-        vault = new RepoVault(address(usdc), address(this));
+        // test contract is DEFAULT_ADMIN_ROLE
+        vault = new RepoVault(address(usdc), address(this), MAINTENANCE);
 
         buidlAdapter = new SimpleCollateralAdapter(address(buidl), 18, NAV, HAIRCUT, address(this));
         ousgAdapter  = new SimpleCollateralAdapter(address(ousg),  18, NAV, HAIRCUT, address(this));
 
-        vault.setAdapter(address(buidl), address(buidlAdapter));
-        vault.setAdapter(address(ousg),  address(ousgAdapter));
+        vault.approveCollateral(address(buidl), address(buidlAdapter));
+        vault.approveCollateral(address(ousg),  address(ousgAdapter));
 
-        // seed vault with cash liquidity
-        usdc.approve(address(vault), type(uint256).max);
-        vault.fundCash(100_000e6);
-
-        // give borrower 100 mBUIDL and 100 mOUSG
+        lender   = makeAddr("lender");
         borrower = makeAddr("borrower");
-        vault.setWhiteListed(borrower, true); // KYC onboarding required by deposit/borrow
-        buidl.transfer(borrower, 100e18);
-        ousg.transfer(borrower,  100e18);
+        keeper   = makeAddr("keeper");
+
+        vault.approveLender(lender);
+        vault.approveBorrower(borrower);
+        vault.approveLiquidator(keeper);
+
+        // fund lender and borrower
+        usdc.transfer(lender, 100_000e6);
+        buidl.transfer(borrower, 200e18);
+        ousg.transfer(borrower,  200e18);
+
+        vm.startPrank(lender);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.stopPrank();
 
         vm.startPrank(borrower);
         buidl.approve(address(vault), type(uint256).max);
@@ -52,258 +63,641 @@ contract RepoVaultTest is Test {
         vm.stopPrank();
     }
 
-    // ── Single-token tests (mirrors original suite) ───────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    function test_DepositAndBorrow() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6, 0);
-        vm.stopPrank();
-
-        assertEq(vault.collateralOf(borrower, address(buidl)), 100e18);
-        assertEq(vault.debtOf(borrower), 98e6);
-        assertEq(usdc.balanceOf(borrower), 98e6);
-        assertEq(vault.maxBorrow(borrower), 98e6);
-        assertTrue(vault.isHealthy(borrower));
+    function _lenderDeposit(uint256 amount) internal {
+        vm.prank(lender);
+        vault.deposit(amount);
     }
 
-    function test_RevertWhen_BorrowExceedsMax() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vm.expectRevert(bytes("exceeds max borrow"));
-        vault.borrow(98e6 + 1, 0);
-        vm.stopPrank();
+    function _borrowerOpen(uint256 cash, uint256 termSeconds) internal {
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, cash, 0, termSeconds);
     }
 
-    function test_RepayReducesDebt() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6, 0);
-        vault.repay(50e6);
-        vm.stopPrank();
+    // ── Lender pool ───────────────────────────────────────────────────────────
 
-        assertEq(vault.debtOf(borrower), 48e6);
+    function test_LenderDeposit_SharesIssued() public {
+        _lenderDeposit(1_000e6);
+        assertEq(vault.lenderShares(lender), 1_000e6);
+        assertEq(vault.totalShares(), 1_000e6);
+        assertEq(vault.poolValue(), 1_000e6);
+        assertEq(vault.freeCash(), 1_000e6);
     }
 
-    function test_WithdrawAfterFullRepay() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6, 0);
+    function test_LenderWithdraw() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(lender);
+        vault.withdraw(500e6);
+        assertEq(usdc.balanceOf(lender), 100_000e6 - 500e6); // got 500 back
+        assertEq(vault.freeCash(), 500e6);
+    }
+
+    function test_LenderWithdrawWithInterest() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days); // borrow at 0% for simplicity
+
+        // simulate interest repaid — transfer 10 mUSDC to vault (represents interest collected)
+        usdc.transfer(address(vault), 10e6);
+
+        // lender's claim is now 1000 + 10 = 1010 (but only freeCash = 912 available)
+        // freeCash = 1000 deposited - 98 borrowed + 10 interest = 912
+        assertEq(vault.freeCash(), 912e6);
+        assertTrue(vault.lenderClaim(lender) > 1_000e6); // has grown
+
+        vm.prank(lender);
+        vault.withdrawWithInterest();
+        // lender withdrew all available free cash
+        assertTrue(usdc.balanceOf(lender) > 100_000e6 - 1_000e6 + 912e6 - 1); // got back most
+    }
+
+    function test_Utilization() public {
+        _lenderDeposit(1_000e6);
+        assertEq(vault.utilization(), 0);
+        buidl.transfer(borrower, 400e18); // top up so borrower has 600 total
+        vm.prank(borrower);
+        vault.open(address(buidl), 600e18, 500e6, 0, 30 days); // maxBorrow=588, borrow 500
+        // utilization = 500 / (500 free + 500 borrowed) = 50%
+        assertEq(vault.utilization(), 0.5e18);
+    }
+
+    function test_FreeCash_DecreasesOnBorrow() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+        assertEq(vault.freeCash(), 902e6);
+    }
+
+    // ── Open / repay ──────────────────────────────────────────────────────────
+
+    function test_Open_And_Repay() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
+
+        assertEq(vault.positions(borrower).principal, 98e6);
+        assertEq(vault.totalDebt(borrower), 98e6);
+        assertTrue(vault.isAboveInitialMargin(borrower));
+
+        vm.prank(borrower);
         vault.repay(98e6);
-        vault.withdrawCollateral(address(buidl), 100e18);
-        vm.stopPrank();
 
-        assertEq(vault.collateralOf(borrower, address(buidl)), 0);
-        assertEq(vault.debtOf(borrower), 0);
-        assertEq(buidl.balanceOf(borrower), 100e18);
+        assertEq(vault.positions(borrower).principal, 0);
+        assertEq(vault.totalBorrowed(), 0);
     }
 
-    function test_RevertWhen_WithdrawBreaksHealth() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6, 0);
-        vm.expectRevert(bytes("would undercollateralize"));
-        vault.withdrawCollateral(address(buidl), 100e18);
-        vm.stopPrank();
+    function test_RevertWhen_OpenBelowInitialMargin() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vm.expectRevert(bytes("below initial margin"));
+        vault.open(address(buidl), 100e18, 99e6, 0, 30 days); // 99% > 98% max
     }
 
-    // ── Multi-token tests ─────────────────────────────────────────────────────
+    function test_PartialRepay() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
 
-    // Borrower posts two different tokens; maxBorrow reflects the combined value.
-    function test_MultiTokenCollateral_CombinedValue() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18); // worth 100 mUSDC, cap 98
-        vault.depositCollateral(address(ousg),  100e18); // worth 100 mUSDC, cap 98
-        vm.stopPrank();
+        vm.prank(borrower);
+        vault.repay(50e6);
 
-        // total collateral value = 200 mUSDC, maxBorrow = 200 * 98% = 196 mUSDC
+        assertEq(vault.positions(borrower).principal, 48e6);
+        assertEq(vault.totalBorrowed(), 48e6);
+    }
+
+    function test_RepayWithInterest() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 100, 365 days); // 1% p.a.
+
+        vm.warp(block.timestamp + 365 days);
+        assertEq(vault.interestOwed(borrower), 980_000); // 98e6 * 1%
+
+        usdc.transfer(borrower, 980_000); // top up borrower for interest
+        vm.prank(borrower);
+        vault.repay(98_980_000); // principal + interest
+
+        assertEq(vault.positions(borrower).principal, 0);
+        assertEq(vault.interestOwed(borrower), 0);
+    }
+
+    // ── Multi-token collateral ────────────────────────────────────────────────
+
+    function test_MultiToken_CombinedValue() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
+
+        vm.prank(borrower);
+        vault.postAdditionalCollateral(address(ousg), 100e18);
+
         assertEq(vault.totalCollateralValue(borrower), 200e6);
         assertEq(vault.maxBorrow(borrower), 196e6);
     }
 
-    function test_MultiTokenCollateral_BorrowUpToAggregateMax() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.depositCollateral(address(ousg),  100e18);
-        vault.borrow(196e6, 0); // exactly at the combined ceiling
-        vm.stopPrank();
+    function test_SubstituteCollateral() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
 
-        assertTrue(vault.isHealthy(borrower));
-        assertEq(vault.debtOf(borrower), 196e6);
+        // swap 50 buidl for 60 ousg (more than enough to maintain margin)
+        vm.prank(borrower);
+        vault.substituteCollateral(address(buidl), 50e18, address(ousg), 60e18);
+
+        assertEq(vault.collateralOf(borrower, address(buidl)), 50e18);
+        assertEq(vault.collateralOf(borrower, address(ousg)),  60e18);
+        assertTrue(vault.isAboveInitialMargin(borrower));
     }
 
-    function test_MultiTokenCollateral_PerTokenHaircutApplied() public {
-        // register a third token with a 10% haircut
-        MockBUIDL highRisk = new MockBUIDL(address(this));
-        SimpleCollateralAdapter highRiskAdapter = new SimpleCollateralAdapter(
-            address(highRisk), 18, NAV, 1_000, address(this) // 10% haircut
+    function test_RevertWhen_SubstituteCollateral_BreachesMargin() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
+
+        // try to swap 100 buidl for only 1 ousg (insufficient)
+        vm.prank(borrower);
+        vm.expectRevert(bytes("below initial margin after substitution"));
+        vault.substituteCollateral(address(buidl), 100e18, address(ousg), 1e18);
+    }
+
+    // ── Margin call & liquidation ─────────────────────────────────────────────
+
+    function test_TriggerMarginCall_WhenBelowMaintenance() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+
+        // drop NAV so collateralValue falls from 100 to 98.5:
+        // debt=98, maintenance threshold = 98.5 * 99% = 97.5 < 98 → margin call zone
+        SimpleCollateralAdapter lowNavAdapter = new SimpleCollateralAdapter(
+            address(buidl), 18, 0.985e6, HAIRCUT, address(this)
         );
-        vault.setAdapter(address(highRisk), address(highRiskAdapter));
-        highRisk.transfer(borrower, 100e18);
+        vault.approveCollateral(address(buidl), address(lowNavAdapter));
 
-        vm.startPrank(borrower);
-        highRisk.approve(address(vault), type(uint256).max);
-        vault.depositCollateral(address(highRisk), 100e18);
-        vm.stopPrank();
+        assertFalse(vault.isAboveMaintenanceMargin(borrower));
 
-        // 100 mUSDC at 10% haircut = 90 mUSDC borrow capacity
-        assertEq(vault.tokenCollateralValue(address(highRisk), borrower), 100e6);
-        assertEq(vault.maxBorrow(borrower), 90e6);
+        vm.prank(keeper);
+        vault.triggerMarginCall(borrower);
+
+        assertGt(vault.positions(borrower).marginCallAt, 0);
+    }
+
+    function test_MarginCallCleared_OnCure() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+
+        SimpleCollateralAdapter lowNavAdapter = new SimpleCollateralAdapter(
+            address(buidl), 18, 0.985e6, HAIRCUT, address(this)
+        );
+        vault.approveCollateral(address(buidl), address(lowNavAdapter));
+        vm.prank(keeper);
+        vault.triggerMarginCall(borrower);
+        assertGt(vault.positions(borrower).marginCallAt, 0);
+
+        // borrower posts enough collateral to cure
+        vm.prank(borrower);
+        vault.postAdditionalCollateral(address(buidl), 20e18); // pushes value well above maintenance
+        assertEq(vault.positions(borrower).marginCallAt, 0); // cleared
+    }
+
+    function test_Liquidate_AfterMarginCall() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+
+        SimpleCollateralAdapter lowNavAdapter = new SimpleCollateralAdapter(
+            address(buidl), 18, 0.97e6, HAIRCUT, address(this)
+        );
+        vault.approveCollateral(address(buidl), address(lowNavAdapter));
+        vm.prank(keeper);
+        vault.triggerMarginCall(borrower);
+
+        uint256 recipientBefore = buidl.balanceOf(address(this));
+        vm.prank(keeper);
+        vault.liquidate(borrower);
+
+        assertEq(vault.positions(borrower).principal, 0);
+        assertEq(buidl.balanceOf(address(this)), recipientBefore + 100e18);
+    }
+
+    function test_RevertWhen_TriggerMarginCall_WhenHealthy() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+        vm.prank(keeper);
+        vm.expectRevert(bytes("above maintenance margin"));
+        vault.triggerMarginCall(borrower);
+    }
+
+    function test_RevertWhen_Liquidate_WithoutMarginCall() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+
+        SimpleCollateralAdapter lowNavAdapter = new SimpleCollateralAdapter(
+            address(buidl), 18, 0.97e6, HAIRCUT, address(this)
+        );
+        vault.approveCollateral(address(buidl), address(lowNavAdapter));
+
+        vm.prank(keeper);
+        vm.expectRevert(bytes("no margin call issued"));
+        vault.liquidate(borrower);
+    }
+
+    // ── Term repo: expire & rollover ──────────────────────────────────────────
+
+    function test_Expire_AfterMaturity() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 7 days);
+
+        vm.warp(block.timestamp + 7 days + 1);
+
+        uint256 recipientBefore = buidl.balanceOf(address(this));
+        vault.expire(borrower);
+
+        assertEq(vault.positions(borrower).principal, 0);
+        assertEq(buidl.balanceOf(address(this)), recipientBefore + 100e18);
+    }
+
+    function test_RevertWhen_Expire_BeforeMaturity() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 7 days);
+        vm.warp(block.timestamp + 6 days);
+        vm.expectRevert(bytes("not yet expirable"));
+        vault.expire(borrower);
+    }
+
+    function test_EarlyTermination_Flow() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+
+        vm.prank(borrower);
+        vault.proposeEarlyTermination();
+        assertTrue(vault.positions(borrower).earlyTermProposed);
+
+        vault.acceptEarlyTermination(borrower);
+        assertFalse(vault.positions(borrower).earlyTermProposed);
+        assertEq(vault.positions(borrower).maturity, block.timestamp + 24 hours);
+    }
+
+    function test_Rollover_TermToTerm() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 7 days);
+
+        vault.offerRollover(borrower, 200, 30 days, 1 days);
+        vm.prank(borrower);
+        vault.acceptRollover();
+
+        assertEq(vault.positions(borrower).rateBps, 200);
+        assertEq(vault.positions(borrower).maturity, block.timestamp + 30 days);
+    }
+
+    function test_Rollover_TermToOpen() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 7 days);
+
+        vault.offerRollover(borrower, 150, 0, 1 days); // 0 = open repo
+        vm.prank(borrower);
+        vault.acceptRollover();
+
+        assertTrue(vault.isOpenRepo(borrower));
+        assertEq(vault.positions(borrower).maturity, 0);
+    }
+
+    function test_RevertWhen_AcceptExpiredOffer() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 7 days);
+        vault.offerRollover(borrower, 200, 30 days, 1 days);
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.prank(borrower);
+        vm.expectRevert(bytes("offer expired"));
+        vault.acceptRollover();
+    }
+
+    // ── Open repo: termination ────────────────────────────────────────────────
+
+    function test_OpenRepo_LenderTermination() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 0); // open repo
+
+        vault.notifyTermination(borrower, 1 days);
+        vm.warp(block.timestamp + 1 days + 1);
+
+        uint256 recipientBefore = buidl.balanceOf(address(this));
+        vault.expire(borrower);
+        assertEq(buidl.balanceOf(address(this)), recipientBefore + 100e18);
+    }
+
+    function test_OpenRepo_BorrowerTermination() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 0);
+
+        vm.prank(borrower);
+        vault.giveTerminationNotice(1 days);
+
+        vm.warp(block.timestamp + 1 days + 1);
+        vault.expire(borrower);
+        assertEq(vault.positions(borrower).principal, 0);
+    }
+
+    function test_OpenRepo_UpdateRepoRate() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 100, 0); // 1% p.a., open repo
+
+        vm.warp(block.timestamp + 180 days);
+        vault.updateRepoRate(borrower, 200); // 2% p.a. going forward
+
+        // interest before rate change is snapshotted correctly
+        uint256 interestAt180 = vault.positions(borrower).interestAccrued;
+        assertGt(interestAt180, 0);
+        assertEq(vault.positions(borrower).rateBps, 200);
+        assertEq(vault.positions(borrower).startTimestamp, block.timestamp);
+    }
+
+    // ── Access control ────────────────────────────────────────────────────────
+
+    function test_RevertWhen_UnauthorisedDeposit() public {
+        address rando = makeAddr("rando");
+        vm.prank(rando);
+        vm.expectRevert();
+        vault.deposit(100e6);
+    }
+
+    function test_RevertWhen_UnauthorisedOpen() public {
+        _lenderDeposit(1_000e6);
+        address rando = makeAddr("rando");
+        vm.prank(rando);
+        vm.expectRevert();
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
+    }
+
+    function test_Pause_BlocksDeposit() public {
+        vault.pause();
+        vm.prank(lender);
+        vm.expectRevert();
+        vault.deposit(100e6);
+    }
+
+    function test_Unpause_RestoresDeposit() public {
+        vault.pause();
+        vault.unpause();
+        _lenderDeposit(1_000e6);
+        assertEq(vault.freeCash(), 1_000e6);
+    }
+
+    // ── Chainlink adapter ─────────────────────────────────────────────────────
+
+    function test_ChainlinkAdapter_NavFromFeed() public {
+        _lenderDeposit(1_000e6);
+        MockV3Aggregator feed = new MockV3Aggregator(8, 1_05_000_000); // $1.05
+        ChainLinkCollateralAdapter clAdapter = new ChainLinkCollateralAdapter(
+            address(buidl), 18, address(feed), 26 hours, HAIRCUT, address(this)
+        );
+        vault.approveCollateral(address(buidl), address(clAdapter));
+
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 100e6, 0, 30 days); // 100 * 1.05 * 98% = 102.9 max
+
+        assertEq(vault.totalCollateralValue(borrower), 105e6);
+        assertTrue(vault.isAboveInitialMargin(borrower));
+    }
+
+    function test_ChainlinkAdapter_RevertWhen_Stale() public {
+        _lenderDeposit(1_000e6);
+        MockV3Aggregator feed = new MockV3Aggregator(8, 1_00_000_000);
+        ChainLinkCollateralAdapter clAdapter = new ChainLinkCollateralAdapter(
+            address(buidl), 18, address(feed), 26 hours, HAIRCUT, address(this)
+        );
+        vault.approveCollateral(address(buidl), address(clAdapter));
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
+
+        vm.warp(block.timestamp + 27 hours);
+        vm.expectRevert(bytes("stale price"));
+        vault.totalCollateralValue(borrower);
     }
 
     // ── Adapter management ────────────────────────────────────────────────────
 
-    function test_RevertWhen_DepositUnregisteredToken() public {
-        MockBUIDL unknown = new MockBUIDL(address(this));
-        unknown.transfer(borrower, 10e18);
-
-        vm.startPrank(borrower);
-        unknown.approve(address(vault), type(uint256).max);
-        vm.expectRevert(bytes("token not registered"));
-        vault.depositCollateral(address(unknown), 10e18);
-        vm.stopPrank();
+    function test_RevokeCollateral_BlocksNewDeposits() public {
+        vault.revokeCollateral(address(buidl));
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vm.expectRevert(bytes("token not approved"));
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
     }
 
     function test_AdapterReplacement_NewNavTakesEffect() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vm.stopPrank();
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+        assertEq(vault.maxBorrow(borrower), 98e6);
 
-        assertEq(vault.maxBorrow(borrower), 98e6); // original: nav=1e6, haircut=2%
-
-        // deploy a new adapter with nav = 2e6 (collateral doubled in value)
         SimpleCollateralAdapter newAdapter = new SimpleCollateralAdapter(
-            address(buidl), 18, 2e6, HAIRCUT, address(this)
+            address(buidl), 18, 2e6, HAIRCUT, address(this) // NAV doubled
         );
-        vault.setAdapter(address(buidl), address(newAdapter));
-
-        assertEq(vault.maxBorrow(borrower), 196e6); // 200 * 98%
+        vault.approveCollateral(address(buidl), address(newAdapter));
+        assertEq(vault.maxBorrow(borrower), 196e6);
     }
 
-    function test_CollateralTokenCount() public {
-        assertEq(vault.collateralTokenCount(), 2); // buidl + ousg registered in setUp
-    }
+    // ── E2E test: full lifecycle ───────────────────────────────────────────────
 
-    function test_ChainlinkAdapter_NavFromFeed() public {
-    MockV3Aggregator feed = new MockV3Aggregator(8, 1_05_000_000); // $1.05, 8 dp
-    ChainLinkCollateralAdapter clAdapter = new ChainLinkCollateralAdapter(
-        address(buidl), 18, address(feed), 26 hours, 200, address(this)
-    );
-    vault.setAdapter(address(buidl), address(clAdapter));
+    function test_E2E_FullLifecycle() public {
+        // 1. Lender deposits 10,000 mUSDC into the pool
+        _lenderDeposit(10_000e6);
+        assertEq(vault.poolValue(), 10_000e6);
+        assertEq(vault.utilization(), 0);
 
-    vm.prank(borrower);
-    vault.depositCollateral(address(buidl), 100e18);
-
-    // 100 tokens * $1.05 = $105 collateral value; maxBorrow = $105 * 98% = $102.9
-    assertEq(vault.tokenCollateralValue(address(buidl), borrower), 105e6);
-    assertEq(vault.maxBorrow(borrower), 102_900_000);
-}
-
-    function test_ChainlinkAdapter_RevertWhen_Stale() public {
-        MockV3Aggregator feed = new MockV3Aggregator(8, 1_00_000_000);
-        ChainLinkCollateralAdapter clAdapter = new ChainLinkCollateralAdapter(
-            address(buidl), 18, address(feed), 26 hours, 200, address(this)
-        );
-        vault.setAdapter(address(buidl), address(clAdapter));
-
-        vm.warp(block.timestamp + 27 hours); // past the staleness threshold
-
+        // 2. Borrower opens a 30-day term repo: posts 1000 mBUIDL, draws 980 mUSDC at 2% p.a.
+        buidl.transfer(borrower, 900e18); // give borrower more collateral
         vm.prank(borrower);
-        vault.depositCollateral(address(buidl), 100e18); // deposit still works
+        vault.open(address(buidl), 1_000e18, 980e6, 200, 30 days);
 
-        vm.expectRevert(bytes("stale price"));
-        vault.maxBorrow(borrower); // price read reverts
-    }
+        assertEq(vault.positions(borrower).principal, 980e6);
+        assertEq(vault.totalBorrowed(), 980e6);
+        assertApproxEqAbs(vault.utilization(), 0.098e18, 0.001e18); // ~9.8%
+        assertTrue(vault.isAboveInitialMargin(borrower));
+        assertEq(vault.freeCash(), 9_020e6);
 
-    function test_RevertWhen_NotWhitelisted() public {
-        address stranger = makeAddr("stranger");
+        // 3. Time passes — 15 days. Check interest.
+        vm.warp(block.timestamp + 15 days);
+        uint256 interest15d = vault.interestOwed(borrower);
+        // 980 * 2% * 15/365 ≈ 805,479 μUSDC
+        assertGt(interest15d, 0);
+        assertLt(interest15d, 1e6); // less than 1 mUSDC for 15 days at 2% on 980
 
-        vm.startPrank(stranger);
-        buidl.approve(address(vault), type(uint256).max);
-        vm.expectRevert(bytes("not whitelisted"));
-        vault.depositCollateral(address(buidl), 1e18);
-        vm.stopPrank();
-    }
-
-    function test_Liquidate_UnhealthyPosition() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6, 0); // borrow at the 98% ceiling
-        vm.stopPrank();
-
-        // drop NAV so collateralValue falls below debt: 100 * 0.97 * 98% = 95.06 < 98
+        // 4. NAV dips slightly — position enters maintenance margin zone
         SimpleCollateralAdapter lowNavAdapter = new SimpleCollateralAdapter(
-            address(buidl), 18, 0.97e6, HAIRCUT, address(this)
+            address(buidl), 18, 0.985e6, HAIRCUT, address(this) // 1000 * 0.985 * 98% = 964.3 < 980
         );
-        vault.setAdapter(address(buidl), address(lowNavAdapter));
-        assertFalse(vault.isHealthy(borrower));
+        vault.approveCollateral(address(buidl), address(lowNavAdapter));
+        assertFalse(vault.isAboveMaintenanceMargin(borrower));
 
-        uint256 ownerBuidlBefore = buidl.balanceOf(address(this));
-        vault.liquidate(borrower);
+        // 5. Keeper triggers margin call
+        vm.prank(keeper);
+        vault.triggerMarginCall(borrower);
+        assertGt(vault.positions(borrower).marginCallAt, 0);
 
-        assertEq(vault.debtOf(borrower), 0);
-        assertEq(vault.collateralOf(borrower, address(buidl)), 0);
-        assertEq(buidl.balanceOf(address(this)), ownerBuidlBefore + 100e18);
+        // 6. Borrower cures by posting 50 more mBUIDL
+        vm.prank(borrower);
+        vault.postAdditionalCollateral(address(buidl), 50e18);
+        assertEq(vault.positions(borrower).marginCallAt, 0); // cleared
+
+        // 7. NAV recovers. Lender offers a 60-day rollover at 1.5% p.a.
+        vm.warp(block.timestamp + 15 days); // at original 30-day maturity
+        vault.approveCollateral(address(buidl), address(buidlAdapter)); // reset to NAV=1
+        vault.offerRollover(borrower, 150, 60 days, 1 days);
+
+        vm.prank(borrower);
+        vault.acceptRollover();
+        assertEq(vault.positions(borrower).rateBps, 150);
+        assertEq(vault.positions(borrower).maturity, block.timestamp + 60 days);
+        assertGt(vault.positions(borrower).interestAccrued, 0); // 30 days of interest snapshotted
+
+        // 8. 60 days pass, borrower repays in full (principal + total interest)
+        vm.warp(block.timestamp + 60 days);
+        uint256 finalDebt = vault.totalDebt(borrower);
+        assertGt(finalDebt, 980e6); // interest on top
+        usdc.transfer(borrower, finalDebt - 980e6); // top up borrower with interest amount
+        vm.prank(borrower);
+        vault.repay(finalDebt);
+
+        assertEq(vault.positions(borrower).principal, 0);
+        assertEq(vault.totalBorrowed(), 0);
+
+        // 9. Lender withdraws with interest — pool value > 10,000 (interest collected)
+        assertTrue(vault.poolValue() > 10_000e6);
+        assertTrue(vault.lenderClaim(lender) > 10_000e6);
+        vm.prank(lender);
+        vault.withdrawWithInterest();
+        assertTrue(usdc.balanceOf(lender) > 100_000e6 - 10_000e6); // recovered more than principal
     }
 
-    function test_RevertWhen_Liquidate_HealthyPosition() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(50e6, 0); // well under the ceiling
-        vm.stopPrank();
-
-        vm.expectRevert(bytes("position is healthy"));
-        vault.liquidate(borrower);
-    }
-
-    function test_InterestAccrues() public {
+    function test_PartialRepay_InterestCarriedForward() public {
+        _lenderDeposit(1_000e6);
         vm.prank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vm.prank(borrower);
-        vault.borrow(98e6, 100); // 100 bps/day = 1%/annum
+        vault.open(address(buidl), 100e18, 98e6, 100, 365 days); // 1% p.a.
 
+        // after 1 year: interest = 98e6 * 1% = 980_000
         vm.warp(block.timestamp + 365 days);
-
-        // 100 mUSDC * 1% * 1 day = 1 mUSDC interest
         assertEq(vault.interestOwed(borrower), 980_000);
-    }
 
-    function test_RepaySettlesInterestOnClose() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6, 100); // 1%/day
-        vm.stopPrank();
-
-        vm.warp(block.timestamp + 365 days);
-
-        // borrower only holds what they borrowed — top up with interest amount
-        usdc.transfer(borrower, 980_000);
-
-        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        // partial repay 49e6 principal — this resets the clock
         vm.prank(borrower);
-        vault.repay(98_980_000); // 98e6 principal + 980_000 interest
+        vault.repay(49e6);
+        assertEq(vault.positions(borrower).principal, 49e6);
 
-        assertEq(vault.debtOf(borrower), 0);
+        // interestAccrued checkpoint must hold the 980_000 already earned
+        assertEq(vault.positions(borrower).interestAccrued, 980_000);
+
+        // another year on the remaining 49e6 at 1%: +490_000
+        vm.warp(block.timestamp + 365 days);
+        assertEq(vault.interestOwed(borrower), 980_000 + 490_000);
+
+        // full close: pay remaining 49e6 principal + 1_470_000 total interest
+        usdc.transfer(borrower, 980_000 + 490_000);
+        vm.prank(borrower);
+        vault.repay(49e6 + 980_000 + 490_000);
+
+        assertEq(vault.positions(borrower).principal, 0);
         assertEq(vault.interestOwed(borrower), 0);
-        assertEq(usdc.balanceOf(address(vault)), vaultBefore + 98_980_000);
     }
 
-    function test_PartialRepay_InterestNotCollected() public {
-        vm.startPrank(borrower);
-        vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6, 100); // 1%/day
-        vm.stopPrank();
+    function test_RepayWorksWhenPaused() public {
+    _lenderDeposit(1_000e6);
+    _borrowerOpen(98e6, 30 days);
 
-        vm.warp(block.timestamp + 365 days);
-        // interestOwed = 1 mUSDC, but partial repay only touches principal
+    vault.pause();
 
-        vm.prank(borrower);
-        vault.repay(50e6); // partial
-
-        assertEq(vault.debtOf(borrower), 48e6);
-        assertTrue(vault.interestOwed(borrower) > 0); // interest still accruing
-    }
-
+    // repay must still work
+    vm.prank(borrower);
+    vault.repay(98e6); // should NOT revert
+    assertEq(vault.positions(borrower).principal, 0);
 }
 
+    function test_PostCollateralWorksWhenPaused() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
 
+        SimpleCollateralAdapter lowNav = new SimpleCollateralAdapter(
+            address(buidl), 18, 0.985e6, HAIRCUT, address(this)
+        );
+        vault.approveCollateral(address(buidl), address(lowNav));
+        vm.prank(keeper);
+        vault.triggerMarginCall(borrower);
+
+        vault.pause();
+
+        // borrower must still be able to cure
+        vm.prank(borrower);
+        vault.postAdditionalCollateral(address(buidl), 50e18); // should NOT revert
+    }
+
+    function test_TwoLenders_ProportionalInterest() public {
+        address lender2 = makeAddr("lender2");
+        vault.approveLender(lender2);
+        usdc.transfer(lender2, 1_000e6);
+        vm.prank(lender2);
+        usdc.approve(address(vault), type(uint256).max);
+
+        // lender1 deposits 1000, lender2 deposits 1000
+        _lenderDeposit(1_000e6);
+        vm.prank(lender2);
+        vault.deposit(1_000e6);
+
+        // borrower opens and repays with 100e6 interest
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 30 days);
+        usdc.transfer(address(vault), 100e6); // simulate interest landing in vault
+
+        // both should have equal claims (deposited equally)
+        assertApproxEqAbs(vault.lenderClaim(lender), vault.lenderClaim(lender2), 1);
+
+        // each should have claim > their original 1000 deposit
+        assertTrue(vault.lenderClaim(lender) > 1_000e6);
+    }
+
+    function test_LenderCannotWithdrawBorrowedCash() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days); // 98 of 1000 is now borrowed
+
+        // lender tries to withdraw 1000 — only 902 is free
+        vm.prank(lender);
+        vm.expectRevert(bytes("insufficient free cash"));
+        vault.withdraw(1_000e6);
+
+        // 902 should succeed
+        vm.prank(lender);
+        vault.withdraw(902e6);
+    }
+
+    function test_RevertWhen_PoolDry() public {
+        _lenderDeposit(100e6); // only 100 in pool
+
+        vm.prank(borrower);
+        vm.expectRevert(bytes("insufficient pool liquidity"));
+        vault.open(address(buidl), 100e18, 101e6, 0, 30 days); // trying to borrow 101
+    }
+
+    function test_ExpireRespects24hGraceAfterEarlyTerm() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+
+        vm.prank(borrower);
+        vault.proposeEarlyTermination();
+        vault.acceptEarlyTermination(borrower);
+
+        // immediately after acceptance: should NOT be expirable
+        vm.expectRevert(bytes("not yet expirable"));
+        vault.expire(borrower);
+
+        // after 24h: expirable
+        vm.warp(block.timestamp + 24 hours + 1);
+        vault.expire(borrower); // should succeed
+    }
+
+    function test_RevertWhen_RateExceedsCap() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vault.open(address(buidl), 100e18, 98e6, 0, 0); // open repo
+
+        vm.expectRevert(bytes("rate exceeds cap"));
+        vault.updateRepoRate(borrower, 5_001); // 50.01% p.a.
+    }
+}
