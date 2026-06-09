@@ -57,7 +57,7 @@ contract RepoVaultTest is Test {
     function test_DepositAndBorrow() public {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6);
+        vault.borrow(98e6, 0);
         vm.stopPrank();
 
         assertEq(vault.collateralOf(borrower, address(buidl)), 100e18);
@@ -71,14 +71,14 @@ contract RepoVaultTest is Test {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
         vm.expectRevert(bytes("exceeds max borrow"));
-        vault.borrow(98e6 + 1);
+        vault.borrow(98e6 + 1, 0);
         vm.stopPrank();
     }
 
     function test_RepayReducesDebt() public {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6);
+        vault.borrow(98e6, 0);
         vault.repay(50e6);
         vm.stopPrank();
 
@@ -88,7 +88,7 @@ contract RepoVaultTest is Test {
     function test_WithdrawAfterFullRepay() public {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6);
+        vault.borrow(98e6, 0);
         vault.repay(98e6);
         vault.withdrawCollateral(address(buidl), 100e18);
         vm.stopPrank();
@@ -101,7 +101,7 @@ contract RepoVaultTest is Test {
     function test_RevertWhen_WithdrawBreaksHealth() public {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6);
+        vault.borrow(98e6, 0);
         vm.expectRevert(bytes("would undercollateralize"));
         vault.withdrawCollateral(address(buidl), 100e18);
         vm.stopPrank();
@@ -125,7 +125,7 @@ contract RepoVaultTest is Test {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
         vault.depositCollateral(address(ousg),  100e18);
-        vault.borrow(196e6); // exactly at the combined ceiling
+        vault.borrow(196e6, 0); // exactly at the combined ceiling
         vm.stopPrank();
 
         assertTrue(vault.isHealthy(borrower));
@@ -228,7 +228,7 @@ contract RepoVaultTest is Test {
     function test_Liquidate_UnhealthyPosition() public {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(98e6); // borrow at the 98% ceiling
+        vault.borrow(98e6, 0); // borrow at the 98% ceiling
         vm.stopPrank();
 
         // drop NAV so collateralValue falls below debt: 100 * 0.97 * 98% = 95.06 < 98
@@ -249,11 +249,59 @@ contract RepoVaultTest is Test {
     function test_RevertWhen_Liquidate_HealthyPosition() public {
         vm.startPrank(borrower);
         vault.depositCollateral(address(buidl), 100e18);
-        vault.borrow(50e6); // well under the ceiling
+        vault.borrow(50e6, 0); // well under the ceiling
         vm.stopPrank();
 
         vm.expectRevert(bytes("position is healthy"));
         vault.liquidate(borrower);
+    }
+
+    function test_InterestAccrues() public {
+        vm.prank(borrower);
+        vault.depositCollateral(address(buidl), 100e18);
+        vm.prank(borrower);
+        vault.borrow(98e6, 100); // 100 bps/day = 1%/annum
+
+        vm.warp(block.timestamp + 365 days);
+
+        // 100 mUSDC * 1% * 1 day = 1 mUSDC interest
+        assertEq(vault.interestOwed(borrower), 980_000);
+    }
+
+    function test_RepaySettlesInterestOnClose() public {
+        vm.startPrank(borrower);
+        vault.depositCollateral(address(buidl), 100e18);
+        vault.borrow(98e6, 100); // 1%/day
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 365 days);
+
+        // borrower only holds what they borrowed — top up with interest amount
+        usdc.transfer(borrower, 980_000);
+
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        vm.prank(borrower);
+        vault.repay(98_980_000); // 98e6 principal + 980_000 interest
+
+        assertEq(vault.debtOf(borrower), 0);
+        assertEq(vault.interestOwed(borrower), 0);
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore + 98_980_000);
+    }
+
+    function test_PartialRepay_InterestNotCollected() public {
+        vm.startPrank(borrower);
+        vault.depositCollateral(address(buidl), 100e18);
+        vault.borrow(98e6, 100); // 1%/day
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 365 days);
+        // interestOwed = 1 mUSDC, but partial repay only touches principal
+
+        vm.prank(borrower);
+        vault.repay(50e6); // partial
+
+        assertEq(vault.debtOf(borrower), 48e6);
+        assertTrue(vault.interestOwed(borrower) > 0); // interest still accruing
     }
 
 }

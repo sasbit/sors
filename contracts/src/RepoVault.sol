@@ -27,6 +27,10 @@ contract RepoVault is Ownable {
     mapping(address => uint256) public debtOf;
     // KYC allowlist
     mapping(address => bool) public whitelisted;
+    // interest rate maps
+    mapping(address => uint256) public borrowTimestamp; //when position was opened
+    mapping(address => uint256) public borrowRateBps; //rate per annum
+    mapping(address => uint256) public interestAccrued; //checkpointed interest before last clock reset
 
     event AdapterSet(address indexed token, address indexed adapter);
     event CashFunded(address indexed from, uint256 amount);
@@ -36,6 +40,7 @@ contract RepoVault is Ownable {
     event Repaid(address indexed borrower, uint256 amount);
     event Whitelisted(address indexed account, bool status);
     event Liquidated(address indexed borrower, uint256 debt);
+    
     
     constructor(address cashToken_, address initialOwner) Ownable(initialOwner) {
         require(cashToken_ != address(0), "zero cash token");
@@ -89,9 +94,15 @@ contract RepoVault is Ownable {
         emit CollateralWithdrawn(msg.sender, token, amount);
     }
 
-    function borrow(uint256 amount) external {
+    function borrow(uint256 amount, uint256 rateBps) external {
         require(whitelisted[msg.sender], "not whitelisted");
         require(amount > 0, "zero amount");
+        if (debtOf[msg.sender] == 0) {
+            borrowTimestamp[msg.sender] = block.timestamp;
+            borrowRateBps[msg.sender] = rateBps;
+        } else {
+            require(rateBps == borrowRateBps[msg.sender], "rate mismatch");
+        }
         debtOf[msg.sender] += amount;
         require(debtOf[msg.sender] <= maxBorrow(msg.sender), "exceeds max borrow");
         cashToken.safeTransfer(msg.sender, amount);
@@ -99,11 +110,21 @@ contract RepoVault is Ownable {
     }
 
     function repay(uint256 amount) external {
-        uint256 debt    = debtOf[msg.sender];
-        uint256 payment = amount > debt ? debt : amount; // clamp: never overpay
-        cashToken.safeTransferFrom(msg.sender, address(this), payment);
-        debtOf[msg.sender] = debt - payment;
-        emit Repaid(msg.sender, payment);
+        uint256 principal        = debtOf[msg.sender];
+        uint256 principalPayment = amount > principal ? principal : amount;
+        uint256 newPrincipal     = principal - principalPayment;
+
+        uint256 interestPayment = 0;
+        if (newPrincipal == 0) {
+            interestPayment             = interestOwed(msg.sender); // read before zeroing debtOf
+            interestAccrued[msg.sender] = 0;
+            borrowTimestamp[msg.sender] = 0;
+            borrowRateBps[msg.sender]   = 0;
+        }
+
+        debtOf[msg.sender] = newPrincipal;
+        cashToken.safeTransferFrom(msg.sender, address(this), principalPayment + interestPayment);
+        emit Repaid(msg.sender, principalPayment + interestPayment);
     }
 
     // ── View ──────────────────────────────────────────────────────────────────
@@ -143,7 +164,14 @@ contract RepoVault is Ownable {
     }
 
     function isHealthy(address borrower) public view returns (bool) {
-        return debtOf[borrower] <= maxBorrow(borrower);
+        return debtOf[borrower] + interestOwed(borrower)<= maxBorrow(borrower);
+    }
+
+    function interestOwed(address borrower) public view returns (uint256) {
+        if (debtOf[borrower]  == 0) return 0;
+        uint256 elapsed = block.timestamp - borrowTimestamp[borrower];
+        uint256 accruing = debtOf[borrower] * borrowRateBps[borrower] * elapsed / (365 days * 10_000);
+        return interestAccrued[borrower] + accruing;
     }
 
     function collateralTokenCount() external view returns (uint256) {
