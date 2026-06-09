@@ -17,17 +17,20 @@ sol! {
 sol! {
     #[sol(rpc)]
     contract RepoVault {
-        function fundCash(uint256 amount) external;
-        function depositCollateral(address token, uint256 amount) external;
-        function withdrawCollateral(address token, uint256 amount) external;
-        function borrow(uint256 amount) external;
+        function deposit(uint256 amount) external;
+        function withdraw(uint256 amount) external;
+        function open(address token, uint256 collateralAmt, uint256 cashAmt, uint256 rateBps, uint256 termSeconds) external;
         function repay(uint256 amount) external;
+        function withdrawCollateral(address token, uint256 amount) external;
         function collateralOf(address borrower, address token) external view returns (uint256);
-        function debtOf(address borrower) external view returns (uint256);
-        function tokenCollateralValue(address token, address borrower) external view returns (uint256);
+        function totalDebt(address borrower) external view returns (uint256);
+        function interestOwed(address borrower) external view returns (uint256);
         function totalCollateralValue(address borrower) external view returns (uint256);
         function maxBorrow(address borrower) external view returns (uint256);
-        function isHealthy(address borrower) external view returns (bool);
+        function isAboveInitialMargin(address borrower) external view returns (bool);
+        function lenderClaim(address lender) external view returns (uint256);
+        function freeCash() external view returns (uint256);
+        function poolValue() external view returns (uint256);
         function collateralTokenCount() external view returns (uint256);
     }
 }
@@ -64,6 +67,10 @@ async fn main() -> Result<()> {
     let fund_amount       = U256::from(1_000u64) * usdc_scale;
     let collateral_amount = U256::from(100u64)   * buidl_scale;
     let borrow_amount     = U256::from(98u64)    * usdc_scale;
+    let rate_bps    = U256::from(0u64);               // 0% p.a. for this demo
+    let term_secs   = U256::from(30u64 * 24 * 3600);  // 30-day term
+
+
 
     println!("registered collateral tokens: {}",
         vault_lender.collateralTokenCount().call().await?);
@@ -75,30 +82,29 @@ async fn main() -> Result<()> {
     // --- Lender: seed the cash pool ---
     println!("[1/6] lender approve mUSDC -> vault");
     usdc_lender.approve(vault_address, U256::MAX).send().await?.get_receipt().await?;
-    println!("[2/6] lender fundCash 1,000 mUSDC");
-    vault_lender.fundCash(fund_amount).send().await?.get_receipt().await?;
+    println!("[2/6] lender deposit 1,000 mUSDC");
+    vault_lender.deposit(fund_amount).send().await?.get_receipt().await?;
 
     // --- Borrower: post collateral and draw cash ---
-    println!("[3/6] borrower approve mBUIDL -> vault");
+    println!("[3/5] borrower approve mBUIDL -> vault");
     buidl_borrower.approve(vault_address, U256::MAX).send().await?.get_receipt().await?;
-    println!("[4/6] borrower depositCollateral 100 mBUIDL");
-    vault_borrower.depositCollateral(buidl_address, collateral_amount).send().await?.get_receipt().await?;
-    println!("[5/6] borrower borrow 98 mUSDC");
-    vault_borrower.borrow(borrow_amount).send().await?.get_receipt().await?;
+    
+    println!("[4/5] borrower open: post 100 mBUIDL, draw 98 mUSDC");
+    vault_borrower
+        .open(buidl_address, collateral_amount, borrow_amount, rate_bps, term_secs)
+        .send().await?.get_receipt().await?;
+    
 
-    println!("\n=== after borrow ===");
-    println!("tokenCollateralValue(mBUIDL): {}",
-        vault_borrower.tokenCollateralValue(buidl_address, borrower_addr).call().await? / usdc_scale);
-    println!("totalCollateralValue        : {}",
-        vault_borrower.totalCollateralValue(borrower_addr).call().await? / usdc_scale);
-    println!("maxBorrow                   : {}",
-        vault_borrower.maxBorrow(borrower_addr).call().await? / usdc_scale);
-    println!("debtOf                      : {}",
-        vault_borrower.debtOf(borrower_addr).call().await? / usdc_scale);
-    println!("isHealthy                   : {}",
-        vault_borrower.isHealthy(borrower_addr).call().await?);
-    println!("borrower mUSDC              : {}",
-        usdc_borrower.balanceOf(borrower_addr).call().await? / usdc_scale);
+    println!("\n=== after open ===");
+    println!("freeCash              : {}", vault_lender.freeCash().call().await? / usdc_scale);
+    println!("poolValue             : {}", vault_lender.poolValue().call().await? / usdc_scale);
+    println!("lenderClaim           : {}", vault_lender.lenderClaim(lender_addr).call().await? / usdc_scale);
+    println!("totalCollateralValue  : {}", vault_borrower.totalCollateralValue(borrower_addr).call().await? / usdc_scale);
+    println!("maxBorrow             : {}", vault_borrower.maxBorrow(borrower_addr).call().await? / usdc_scale);
+    println!("totalDebt             : {}", vault_borrower.totalDebt(borrower_addr).call().await? / usdc_scale);
+    println!("interestOwed          : {}", vault_borrower.interestOwed(borrower_addr).call().await? / usdc_scale);
+    println!("isAboveInitialMargin  : {}", vault_borrower.isAboveInitialMargin(borrower_addr).call().await?);
+    println!("borrower mUSDC        : {}", usdc_borrower.balanceOf(borrower_addr).call().await? / usdc_scale);
 
     // --- Close out ---
     println!("\n[6/6] borrower approve mUSDC + repay + withdraw");
@@ -107,12 +113,10 @@ async fn main() -> Result<()> {
     vault_borrower.withdrawCollateral(buidl_address, collateral_amount).send().await?.get_receipt().await?;
 
     println!("\n=== final ===");
-    println!("collateralOf(borrower, mBUIDL): {}",
-        vault_borrower.collateralOf(borrower_addr, buidl_address).call().await? / buidl_scale);
-    println!("debtOf                        : {}",
-        vault_borrower.debtOf(borrower_addr).call().await? / usdc_scale);
-    println!("isHealthy                     : {}",
-        vault_borrower.isHealthy(borrower_addr).call().await?);
+    println!("collateralOf(mBUIDL)  : {}", vault_borrower.collateralOf(borrower_addr, buidl_address).call().await? / buidl_scale);
+    println!("totalDebt             : {}", vault_borrower.totalDebt(borrower_addr).call().await? / usdc_scale);
+    println!("isAboveInitialMargin  : {}", vault_borrower.isAboveInitialMargin(borrower_addr).call().await?);
+    println!("lenderClaim (final)   : {}", vault_lender.lenderClaim(lender_addr).call().await? / usdc_scale);
 
     Ok(())
 }
