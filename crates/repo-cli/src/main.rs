@@ -37,6 +37,7 @@ sol! {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let rpc_url       = env::var("SEPOLIA_RPC_URL")?;
     let lender_key    = env::var("LENDER_PRIVATE_KEY")?;
     let borrower_key  = env::var("BORROWER_PRIVATE_KEY")?;

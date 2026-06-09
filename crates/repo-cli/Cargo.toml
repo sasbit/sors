@@ -7,3 +7,4 @@ edition.workspace = true
 alloy.workspace = true
 tokio.workspace = true
 eyre.workspace = true
+dotenvy = "0.15"
