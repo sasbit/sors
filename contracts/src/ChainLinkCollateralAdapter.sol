@@ -15,38 +15,41 @@ contract ChainLinkCollateralAdapter is ICollateralAdapter, Ownable {
     uint256 public override haircutBps;
 
     AggregatorV3Interface public immutable priceFeed;
-    uint8 private immutable feedDecimals;
-    uint256 public immutable maxStaleness; //seconds
+    uint8  private immutable feedDecimals;
+    uint8  private immutable cashDecimals; // decimals of the cash token (e.g. 6 for USDC, 18 for DAI)
+    uint256 public immutable maxStaleness;
 
     event HaircutUpdated(uint256 oldHaircutBps, uint256 newHaircutBps);
 
     constructor(
         address token_,
-        uint8 decimals_,
+        uint8   decimals_,
         address priceFeed_,
         uint256 maxStaleness_,
         uint256 haircutBps_,
+        uint8   cashDecimals_,
         address initialOwner_
     ) Ownable(initialOwner_) {
-        require(token_ != address(0), "zero token");
-        require(priceFeed_ !=address(0), "zero feed");
-        require(maxStaleness_ > 0, "zero staleness");
-        require(haircutBps_ <= 10_000, "haircut > 100%");
-        
+        require(token_     != address(0), "zero token");
+        require(priceFeed_ != address(0), "zero feed");
+        require(maxStaleness_ > 0,        "zero staleness");
+        require(haircutBps_ <= 10_000,    "haircut > 100%");
+
         token        = token_;
         decimals     = decimals_;
         priceFeed    = AggregatorV3Interface(priceFeed_);
         feedDecimals = AggregatorV3Interface(priceFeed_).decimals();
+        cashDecimals = cashDecimals_;
         maxStaleness = maxStaleness_;
         haircutBps   = haircutBps_;
     }
 
     function nav() external view override returns (uint256) {
         (, int256 answer, , uint256 updatedAt,) = priceFeed.latestRoundData();
-        require(answer > 0, "invalid price");
-        require(block.timestamp - updatedAt <= maxStaleness, "stale price");
-        // scale from feedDecimals to 6 dp (USDC)
-        return uint256(answer) * 1e6 / (10 ** feedDecimals);
+        require(answer > 0,                                    "invalid price");
+        require(block.timestamp - updatedAt <= maxStaleness,   "stale price");
+        // scale from feedDecimals to cashDecimals
+        return uint256(answer) * (10 ** cashDecimals) / (10 ** feedDecimals);
     }
 
     function setHaircut(uint256 newHaircutBps) external onlyOwner {

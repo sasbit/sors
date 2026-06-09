@@ -68,8 +68,10 @@ contract RepoVault is AccessControl, Pausable {
     // to the pool, otherwise lenders absorb the loss from the reduced poolValue.
     address public collateralRecipient;
 
-    uint256 public constant MAX_RATE_BPS = 5_000; // 50% p.a. hard cap on repo rate
-    uint256 public constant EARLY_TERM_GRACE = 24 hours; // grace period after acceptEarlyTermination
+    uint256 public constant MAX_RATE_BPS          = 5_000; // 50% p.a. hard cap on repo rate
+    uint256 public constant EARLY_TERM_GRACE      = 24 hours;
+    uint256 public constant MAX_NOTICE_PERIOD     = 30 days; // cap on self-notice to prevent blocking admin
+    uint256 public constant MAX_MAINTENANCE_BPS   = 9_999;   // must stay below 100% or every position is liquidatable
 
     // ── Events ────────────────────────────────────────────────────────────────
     event Deposited(address indexed lender, uint256 amount, uint256 shares);
@@ -148,6 +150,7 @@ contract RepoVault is AccessControl, Pausable {
     }
 
     function setMaintenanceMargin(uint256 newBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newBps <= MAX_MAINTENANCE_BPS, "maintenance margin too high");
         maintenanceMarginBps = newBps;
         emit MaintenanceMarginUpdated(newBps);
     }
@@ -202,6 +205,7 @@ contract RepoVault is AccessControl, Pausable {
         require(collateralAmt > 0, "zero collateral");
         require(cashAmt > 0, "zero cash");
         require(cashAmt <= freeCash(), "insufficient pool liquidity");
+        require(rateBps <= MAX_RATE_BPS, "rate exceeds cap");
         require(_positions[msg.sender].principal == 0, "position already open");
 
         IERC20(token).safeTransferFrom(msg.sender, address(this), collateralAmt);
@@ -299,6 +303,7 @@ contract RepoVault is AccessControl, Pausable {
 
     // Open repo only: borrower gives formal notice of intent to repay.
     function giveTerminationNotice(uint256 noticePeriodSeconds) external onlyRole(BORROWER_ROLE) whenNotPaused {
+        require(noticePeriodSeconds <= MAX_NOTICE_PERIOD, "notice period too long");
         Position storage p = _positions[msg.sender];
         require(p.principal > 0, "no open position");
         require(p.maturity == 0, "not an open repo");
@@ -319,7 +324,10 @@ contract RepoVault is AccessControl, Pausable {
         p.rateBps                 = offer.newRateBps;
         p.maturity                = offer.newTermSeconds == 0 ? 0 : block.timestamp + offer.newTermSeconds;
         p.terminationAt           = 0;
-        p.marginCallAt            = 0;
+        // only clear margin call if the rolled position is now above maintenance margin
+        if (p.marginCallAt > 0 && isAboveMaintenanceMargin(msg.sender)) {
+            p.marginCallAt = 0;
+        }
         p.earlyTermProposed       = false;
         delete pendingRollover[msg.sender];
         emit RolloverAccepted(msg.sender, offer.newRateBps, p.maturity);
@@ -336,6 +344,7 @@ contract RepoVault is AccessControl, Pausable {
         uint256 offerWindowSeconds
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_positions[borrower].principal > 0, "no open position");
+        require(newRateBps <= MAX_RATE_BPS, "rate exceeds cap");
         uint256 expiry = block.timestamp + offerWindowSeconds;
         pendingRollover[borrower] = RolloverOffer(newRateBps, newTermSeconds, expiry);
         emit RolloverOffered(borrower, newRateBps, newTermSeconds, expiry);

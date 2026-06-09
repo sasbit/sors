@@ -448,7 +448,7 @@ contract RepoVaultTest is Test {
         _lenderDeposit(1_000e6);
         MockV3Aggregator feed = new MockV3Aggregator(8, 1_05_000_000); // $1.05
         ChainLinkCollateralAdapter clAdapter = new ChainLinkCollateralAdapter(
-            address(buidl), 18, address(feed), 26 hours, HAIRCUT, address(this)
+            address(buidl), 18, address(feed), 26 hours, HAIRCUT, 6, address(this)
         );
         vault.approveCollateral(address(buidl), address(clAdapter));
 
@@ -463,7 +463,7 @@ contract RepoVaultTest is Test {
         _lenderDeposit(1_000e6);
         MockV3Aggregator feed = new MockV3Aggregator(8, 1_00_000_000);
         ChainLinkCollateralAdapter clAdapter = new ChainLinkCollateralAdapter(
-            address(buidl), 18, address(feed), 26 hours, HAIRCUT, address(this)
+            address(buidl), 18, address(feed), 26 hours, HAIRCUT, 6, address(this)
         );
         vault.approveCollateral(address(buidl), address(clAdapter));
         vm.prank(borrower);
@@ -699,5 +699,19 @@ contract RepoVaultTest is Test {
 
         vm.expectRevert(bytes("rate exceeds cap"));
         vault.updateRepoRate(borrower, 5_001); // 50.01% p.a.
+    }
+
+    function test_RevertWhen_Open_RateExceedsCap() public {
+        _lenderDeposit(1_000e6);
+        vm.prank(borrower);
+        vm.expectRevert(bytes("rate exceeds cap"));
+        vault.open(address(buidl), 100e18, 98e6, 5_001, 30 days);
+    }
+
+    function test_RevertWhen_OfferRollover_RateExceedsCap() public {
+        _lenderDeposit(1_000e6);
+        _borrowerOpen(98e6, 30 days);
+        vm.expectRevert(bytes("rate exceeds cap"));
+        vault.offerRollover(borrower, 5_001, 30 days, 1 days);
     }
 }
