@@ -13,3 +13,11 @@
 .vscode/
 .idea/
 .DS_Store
+
+# Node
+node_modules/
+.next/
+.env.local
+
+# Claude Code
+.claude/

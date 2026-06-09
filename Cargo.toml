@@ -5,6 +5,8 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2021"
 license = "UNLICENSED"
+members = ["crates/*"]
+exclude = ["apps/*"]
 
 [workspace.dependencies]
 alloy = { version = "1", features = ["full"] }
