@@ -108,10 +108,12 @@ async fn main() -> Result<()> {
     println!("borrower mUSDC        : {}", usdc_borrower.balanceOf(borrower_addr).call().await? / usdc_scale);
 
     // --- Close out ---
+    /* 
     println!("\n[6/6] borrower approve mUSDC + repay + withdraw");
     usdc_borrower.approve(vault_address, U256::MAX).send().await?.get_receipt().await?;
     vault_borrower.repay(borrow_amount).send().await?.get_receipt().await?;
     vault_borrower.withdrawCollateral(buidl_address, collateral_amount).send().await?.get_receipt().await?;
+    */
 
     println!("\n=== final ===");
     println!("collateralOf(mBUIDL)  : {}", vault_borrower.collateralOf(borrower_addr, buidl_address).call().await? / buidl_scale);
