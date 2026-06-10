@@ -1,119 +1,131 @@
-# Sors
+# sors
 
-**On-chain repo for tokenized fixed income.** Sors is a securities-financing venue
-where lenders supply stablecoin cash against tokenized-Treasury collateral and
-borrowers draw that cash on demand. Custody, haircuts, collateralization, and
-settlement are enforced by smart contracts; matching, pricing, and risk run
-off-chain. Funding is secured atomically — collateral and cash move in the same
-transaction, with no settlement window and no dealer in the middle.
+**On-chain repo for tokenized fixed income.** Sors is a securities-financing venue where lenders supply stablecoin cash against tokenized-Treasury collateral and borrowers draw that cash on demand. Custody, haircuts, collateralization, and settlement are enforced by smart contracts; matching, pricing, and risk run off-chain. Funding is secured atomically — collateral and cash move in the same transaction, with no settlement window and no dealer in the middle.
 
 ## Why it exists
 
-Tokenized U.S. Treasuries are the largest real-world-asset category on-chain —
-roughly **$14–15B** in assets as of 2026, led by BlackRock's BUIDL, Hashnote/Circle's
-USYC, Ondo's OUSG, and Franklin Templeton's BENJI — inside a wider ~$34B tokenized-RWA
-market. These instruments are yield-bearing, low-risk, and already accepted as
-collateral, but their biggest unlock is **collateral mobility**: a tokenized T-bill
-can be posted, recalled, and financed in seconds rather than settling T+1 through
-legacy plumbing.
+Tokenized U.S. Treasuries are the largest real-world-asset category on-chain — roughly **$14–15B** in assets as of 2026, led by BlackRock's BUIDL, Hashnote/Circle's USYC, Ondo's OUSG, and Franklin Templeton's BENJI — inside a wider ~$34B tokenized-RWA market. These instruments are yield-bearing, low-risk, and already accepted as collateral, but their biggest unlock is **collateral mobility**: a tokenized T-bill can be posted, recalled, and financed in seconds rather than settling T+1 through legacy plumbing.
 
-That is exactly the gap Sors fills. The $12T+ repo market — the short-term funding
-layer beneath the entire financial system — is moving onto public chains, with
-J.P. Morgan (Kinexys), Banque de France, Société Générale, and UBS already running
-live on-chain repo and tokenized-collateral settlement. Intraday, on-chain repo can
-halve funding costs and free up capital that today sits idle in overnight buffers.
+That is exactly the gap Sors fills. The $12T+ repo market — the short-term funding layer beneath the entire financial system — is moving onto public chains, with J.P. Morgan (Kinexys), Banque de France, Société Générale, and UBS already running live on-chain repo and tokenized-collateral settlement. Intraday, on-chain repo can halve funding costs and free up capital that today sits idle in overnight buffers.
 
-**Sors is repo infrastructure for that world.** It lets a holder of tokenized
-Treasuries turn them into instant working cash without selling the position, and lets
-cash lenders deploy against high-quality, over-collateralized security — with custody,
-margin, and solvency enforced in code rather than by a back office.
+**Sors is repo infrastructure for that world.** It lets a holder of tokenized Treasuries turn them into instant working cash without selling the position, and lets cash lenders deploy against high-quality, over-collateralized security — with custody, margin, and solvency enforced in code rather than by a back office.
 
 ### Who it's for
 
-- **Tokenized-fund holders & trading desks** that want intraday liquidity against
-  BUIDL/USYC/OUSG-style collateral without unwinding their yield.
-- **Stablecoin treasuries & market makers** seeking a secured, short-duration place
-  to deploy cash against high-quality collateral.
-- **Institutions modernizing collateral & liquidity management** that need
-  programmable haircuts, real-time margining, and atomic delivery-versus-payment.
+- **Tokenized-fund holders & trading desks** that want intraday liquidity against BUIDL/USYC/OUSG-style collateral without unwinding their yield.
+- **Stablecoin treasuries & market makers** seeking a secured, short-duration place to deploy cash against high-quality collateral.
+- **Institutions modernizing collateral & liquidity management** that need programmable haircuts, real-time margining, and atomic delivery-versus-payment.
 
 ## How it works
 
 A repo on Sors is a collateralized cash loan with three moving parts:
 
 | Layer | Component | Role |
-| --- | --- | --- |
-| Collateral | **Treasury collateral token** | The tokenized fixed-income asset posted as security (modeled here by `MockBUIDL`, 18 decimals). |
-| Cash | **Stablecoin cash token** | The dollar leg lenders supply and borrowers draw (modeled by `MockUSDC`, 6 decimals to match real USDC). |
-| Venue | **`RepoVault`** | Escrows collateral, holds the cash pool, and enforces how much can be borrowed. |
+|---|---|---|
+| Collateral | Treasury collateral token | Tokenized fixed-income asset posted as security (mBUIDL/mUSYC/mOUSG — decimals match real assets). |
+| Cash | Stablecoin cash token | Dollar leg lenders supply and borrowers draw (mUSDC — 6 decimals to match real USDC). |
+| Venue | `RepoVault` | Escrows collateral, holds the cash pool, and enforces how much can be borrowed. |
 
 The economics the vault enforces:
 
-- **Lenders** fund the vault's cash pool that borrowers draw against, secured at all
-  times by collateral worth more than the cash lent.
-- **Borrowers** post collateral and draw cash up to a **haircut-adjusted** limit of
-  its value: `maxBorrow = collateralValue × (1 − haircut)`. Collateral is valued at
-  its posted **NAV** (net asset value), so the available cash tracks the real worth of
-  the Treasuries, not a fixed peg.
-- **Solvency is continuous.** Every borrow and every collateral withdrawal is checked
-  against the position's health (`debt ≤ maxBorrow`); anything that would leave a
-  position under-collateralized reverts. Healthy positions are distinguishable from
-  unhealthy ones on-chain at any moment, which is the signal a margin/liquidation
-  process acts on.
+- **Lenders** fund the vault's cash pool that borrowers draw against, secured at all times by collateral worth more than the cash lent. Lenders earn interest paid by borrowers pro-rata to their pool share.
+- **Borrowers** post collateral and draw cash up to a haircut-adjusted limit: `maxBorrow = collateralValue × (1 − haircut)`. Collateral is valued at its posted NAV, so available cash tracks the real worth of the Treasuries.
+- **Solvency is continuous.** Every borrow and every collateral withdrawal is checked against the position's health (`debt ≤ maxBorrow`); anything that would leave a position under-collateralized reverts.
+- **Margin & liquidation.** If a position falls below maintenance margin, the keeper triggers a margin call. If the borrower does not cure within the grace period, the keeper liquidates — collateral is seized, debt cleared, lenders made whole.
 
-Borrowers repay to reduce debt and reclaim their collateral; the full lifecycle —
-fund → deposit → borrow → repay → withdraw — settles entirely on-chain.
-
-The split is deliberate: **the chain is the settlement and custody layer** (where
-trust and money live), while **matching, pricing, NAV, and risk are computed
-off-chain** (where flexibility and speed live) and pushed in. A Rust service signs and
-submits transactions and reads venue state.
+The chain is the settlement and custody layer (where trust and money live); matching, pricing, NAV, and risk are computed off-chain and pushed in. A Rust keeper signs and submits margin and expiry transactions automatically.
 
 ## Live deployment (Ethereum Sepolia)
 
 | Contract | Address |
-| --- | --- |
-| `RepoVault` | [`0xF3a45804c853D7829585b1c0f5BC489a0E4ab1c9`](https://sepolia.etherscan.io/address/0xF3a45804c853D7829585b1c0f5BC489a0E4ab1c9) |
-| Treasury collateral (`MockBUIDL`) | [`0x477944B6E89D60638BF76A69273348e444C67CB7`](https://sepolia.etherscan.io/address/0x477944B6E89D60638BF76A69273348e444C67CB7) |
-| Stablecoin cash (`MockUSDC`) | [`0x7fBc681584FC6898B5812aFf75Cc9A19D53E4Aaf`](https://sepolia.etherscan.io/address/0x7fBc681584FC6898B5812aFf75Cc9A19D53E4Aaf) |
-
-The vault is configured at a **2% haircut** and a par NAV (1 collateral token = 1 cash
-dollar). The two tokens are mocks that mirror the decimals and ERC-20 behavior of
-real tokenized-Treasury and stablecoin assets, so the venue logic is identical to what
-runs against production collateral.
+|---|---|
+| `RepoVault` | [`0x9Aa1913b7ECfA45CB957f223571fc671b12a64E7`](https://sepolia.etherscan.io/address/0x9Aa1913b7ECfA45CB957f223571fc671b12a64E7#code) |
+| `MockUSDC` (cash) | [`0x062db38c83b4a9bb719a6e8f3a4fd6c748313c02`](https://sepolia.etherscan.io/address/0x062db38c83b4a9bb719a6e8f3a4fd6c748313c02) |
+| `MockBUIDL` (collateral) | [`0x64100b083e85886baa77334b32d1568d7ea8e855`](https://sepolia.etherscan.io/address/0x64100b083e85886baa77334b32d1568d7ea8e855) |
+| `MockUSYC` (collateral) | [`0x5dddb22bd74d931c7a823a759a4eba493cbb3d63`](https://sepolia.etherscan.io/address/0x5dddb22bd74d931c7a823a759a4eba493cbb3d63) |
+| `MockOUSG` (collateral) | [`0xe88862403c198e227f17232cbbb6c638714dbee8`](https://sepolia.etherscan.io/address/0xe88862403c198e227f17232cbbb6c638714dbee8) |
 
 ## Architecture
 
 ```
 sors/
-├── contracts/          # Foundry project (Solidity) — on-chain settlement & custody
-│   ├── src/            # MockBUIDL (collateral), MockUSDC (cash), RepoVault (venue)
-│   ├── test/           # Foundry tests covering the full repo lifecycle
-│   ├── script/         # DeployRepo.s.sol — one-shot deployment of the venue
-│   └── lib/            # git submodules: openzeppelin-contracts, forge-std
-└── crates/             # Cargo workspace (Rust) — off-chain stack
-    └── repo-cli/       # signs + submits transactions, reads on-chain venue state
+├── contracts/                  # Foundry (Solidity) — on-chain settlement & custody
+│   ├── src/
+│   │   ├── RepoVault.sol               # core venue: pool, positions, margin, liquidation
+│   │   ├── SimpleCollateralAdapter.sol # haircut + NAV adapter for mock tokens
+│   │   ├── ChainLinkCollateralAdapter.sol  # Chainlink oracle adapter (production path)
+│   │   ├── ICollateralAdapter.sol      # adapter interface
+│   │   ├── MockBUIDL.sol               # ERC-20 collateral token (18 dec)
+│   │   └── MockUSDC.sol                # ERC-20 cash token (6 dec)
+│   ├── test/                   # Foundry lifecycle tests
+│   ├── script/
+│   │   └── DeployRepo.s.sol            # one-shot deployment of the full venue
+│   └── lib/                    # git submodules: openzeppelin-contracts, forge-std
+│
+├── crates/                     # Cargo workspace (Rust) — off-chain stack
+│   ├── keeper/                 # automated margin monitor & liquidator
+│   │   └── src/main.rs         # polls every N seconds, triggers margin calls + liquidations
+│   └── repo-cli/               # end-to-end lifecycle script for dev/demo
+│       └── src/main.rs         # mint → lend → borrow → print position state
+│
+└── apps/
+    └── dashboard/              # Next.js 16 App Router — live read + transaction UI
+        ├── app/                # server components (chain reads) + client components (wallet)
+        ├── components/ui/      # WalletButton, ActionPanel (MINT/LEND/BORROW/REPAY/ADMIN tabs)
+        └── config/             # wagmi config, contract addresses + ABIs
 ```
-
-`contracts/` and `crates/` are siblings because Foundry and Cargo are separate
-toolchains; keeping them apart keeps each build system clean. The Rust side is a Cargo
-workspace so every off-chain service shares one lockfile, one `target/`, and unified
-dependency versions.
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs) (stable, 1.90+)
+- [Rust](https://rustup.rs) (stable, 1.80+)
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (`forge`, `cast`)
+- [Node.js](https://nodejs.org) 20+ with npm (for the dashboard)
 
 ## Setup
 
 ```bash
-# Clone with submodules (OpenZeppelin + forge-std live in contracts/lib)
 git clone --recurse-submodules <repo-url>
 cd sors
 
-# If you already cloned without --recurse-submodules:
+# If already cloned without --recurse-submodules:
 git submodule update --init --recursive
+```
+
+## Configuration
+
+All Rust components read from `contracts/.env` (git-ignored). Copy the example and fill in real values:
+
+```bash
+cp contracts/.env.example contracts/.env
+```
+
+Required variables:
+
+```bash
+# RPC
+SEPOLIA_RPC_URL="https://eth-sepolia.g.alchemy.com/v2/<key>"
+
+# Signing keys (testnet only — never commit real keys)
+PRIVATE_KEY="0x..."            # deployer / owner (for forge scripts)
+LENDER_PRIVATE_KEY="0x..."     # lender account (repo-cli)
+BORROWER_PRIVATE_KEY="0x..."   # borrower account (repo-cli)
+KEEPER_PRIVATE_KEY="0x..."     # keeper account — must hold LIQUIDATOR_ROLE on the vault
+
+# Deployed addresses (already set for the current Sepolia deployment)
+REPO_VAULT_ADDRESS="0x9Aa1913b7ECfA45CB957f223571fc671b12a64E7"
+MOCK_USDC_ADDRESS="0x062db38c83b4a9bb719a6e8f3a4fd6c748313c02"
+MOCK_BUIDL_ADDRESS="0x64100b083e85886baa77334b32d1568d7ea8e855"
+
+# Keeper tuning (optional — defaults shown)
+KEEPER_POLL_SECS=30
+KEEPER_STATE_FILE=keeper_state.json
+```
+
+The dashboard reads from `apps/dashboard/.env.local`:
+
+```bash
+NEXT_PUBLIC_ALCHEMY_URL="https://eth-sepolia.g.alchemy.com/v2/<key>"
+NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID="<wc-project-id>"
 ```
 
 ## Build & test
@@ -128,42 +140,87 @@ forge test -vvv
 cargo build
 ```
 
-The Foundry suite exercises deposit, borrowing up to the haircut limit, the
-over-limit and broken-health reverts, debt repayment, and full close-out.
-
-## Configuration
-
-The off-chain client and the deploy script read configuration from `contracts/.env`
-(git-ignored — never commit real keys). See `.env.example` for the full list:
-
-```bash
-SEPOLIA_RPC_URL="https://eth-sepolia.g.alchemy.com/v2/<key>"
-PRIVATE_KEY="0x..."                  # testnet only
-MOCK_BUIDL_ADDRESS="0x4779..."       # deployed Treasury collateral
-MOCK_USDC_ADDRESS="0x7fBc..."        # deployed stablecoin cash
-REPO_VAULT_ADDRESS="0xF3a4..."       # deployed venue
-```
-
 ## Deploy
 
-Deploy the full venue (both token legs + the vault) with one script. Dry-run first,
-then broadcast:
+Deploy all contracts in one script:
 
 ```bash
 cd contracts
 
-# simulate locally — sends nothing, costs nothing
+# Dry run (no broadcast, no gas)
 forge script script/DeployRepo.s.sol:DeployRepo --rpc-url "$SEPOLIA_RPC_URL"
 
-# deploy for real (requires a funded testnet account)
+# Broadcast (requires funded account at PRIVATE_KEY)
 forge script script/DeployRepo.s.sol:DeployRepo --rpc-url "$SEPOLIA_RPC_URL" --broadcast
 ```
 
-## Run the client
+## Run the keeper
 
-With `contracts/.env` populated, the Rust client connects with the configured account,
-submits signed transactions, and reads venue state back from chain:
+The keeper monitors every open position on-chain. It discovers borrowers by scanning `Opened` events from the vault, then every poll interval it checks each position and:
+
+1. Calls `expire()` on positions past maturity
+2. Calls `triggerMarginCall()` on positions below maintenance margin
+3. Calls `liquidate()` on positions already under a margin call
+
+```bash
+# from repo root, with contracts/.env populated
+cargo run -p keeper
+```
+
+Example output:
+
+```
+keeper started — vault 0x9Aa1...64E7 — polling every 30s
+scanning blocks 8120000..8120042
+checking 0xc064…D4e7 … healthy
+```
+
+## Run the lifecycle demo script
+
+`repo-cli` executes the full lend → borrow flow programmatically and prints position state. Useful for verifying contract behavior end-to-end without the UI:
 
 ```bash
 cargo run -p repo-cli
 ```
+
+Example output:
+
+```
+[setup] mint 100 mBUIDL -> borrower
+[1/6] lender approve mUSDC -> vault
+[2/6] lender deposit 1,000 mUSDC
+[3/5] borrower approve mBUIDL -> vault
+[4/5] borrower open: post 100 mBUIDL, draw 98 mUSDC
+
+=== after open ===
+freeCash              : 902
+poolValue             : 1000
+lenderClaim           : 1000
+totalCollateralValue  : 100
+maxBorrow             : 98
+totalDebt             : 98
+isAboveInitialMargin  : true
+borrower mUSDC        : 98
+```
+
+## Run the dashboard
+
+```bash
+cd apps/dashboard
+npm install
+npm run dev
+# → http://localhost:3000
+```
+
+The main page is a server component that reads live chain state on every request via viem. The wallet interaction layer (connect, approve, deposit, borrow, repay, admin) runs client-side via wagmi v3 + WalletConnect.
+
+## Known limitations (Sepolia V1)
+
+| Limitation | Current State | Production Path |
+|---|---|---|
+| Test tokens | mUSDC, mBUIDL/mUSYC/mOUSG (mocks) | Real BUIDL/USYC/OUSG require whitelist onboarding with issuer |
+| Admin key | Single EOA with all roles | Gnosis Safe multisig |
+| Oracle | Admin-set NAV via SimpleCollateralAdapter | ChainlinkCollateralAdapter already built |
+| Network | Sepolia testnet | Mainnet after audit |
+| KYC | AccessControl whitelist | SumSub or Jumio integration |
+| Audit | Not audited | Required before any real capital |
